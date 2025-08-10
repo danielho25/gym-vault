@@ -1,0 +1,10 @@
+cocoindex
+pgvector
+postresql 17
+numpy
+pandas
+scikit-learn
+psycopg pool, binary
+fastapi
+uvicorn
+pydantic
