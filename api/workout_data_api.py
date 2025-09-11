@@ -9,9 +9,6 @@ from fastapi.testclient import TestClient
 from dotenv import load_dotenv
 # from datetime import date
 
-# TODO: CORS ERROR sending data (port mismatch 5173 (react) vs 8000 (api))
-# TODO: Need to fix
-
 # API to set workout data in postgres
 
 # model to define the input of our workout data
@@ -28,21 +25,33 @@ class Workout_Data_Row(BaseModel):
 
 # create an instance of the api
 app = FastAPI()
-client = TestClient(app)
 
+# CORS origins - be more specific in production
 origins = [
     "http://localhost:5173",
-    # "http://localhost:5173/Workout_Form"
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",  # Common React dev port
+    "http://127.0.0.1:3000",
 ]
 
-# block unauthorized requests
+# Add CORS middleware BEFORE other middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=origins,  # Use specific origins instead of "*" for better security
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"]
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
 )
+
+# Debug middleware - place AFTER CORS
+@app.middleware("http")
+async def log_origin(request, call_next):
+    print(">>> REQUEST METHOD:", request.method)
+    print(">>> ORIGIN HEADER:", request.headers.get("origin"))
+    print(">>> CONTENT-TYPE:", request.headers.get("content-type"))
+    response = await call_next(request)
+    print(">>> RESPONSE STATUS:", response.status_code)
+    return response
 
 
 # Database connection helper
@@ -62,10 +71,11 @@ def create_workout_data(workout_data: Workout_Data):
         conn = get_db_connection()
         cursor = conn.cursor()
 
+        # Fixed: Remove extra %s placeholder - only 3 values being inserted
         cursor.execute(
             """
             INSERT INTO workout_data (exercise_name, sets, reps)
-            VALUES (%s, %s, %s, %s);
+            VALUES (%s, %s, %s);
             """,
             (workout_data.exercise_name, workout_data.sets, workout_data.reps)
         )
@@ -186,6 +196,12 @@ def delete_workout_by_exercise(exercise_name: str):
     finally:
         if conn:
             conn.close()
+
+
+# Add a health check endpoint
+@app.get("/health")
+def health_check():
+    return {"status": "healthy"}
 
 
 def main() -> None:
