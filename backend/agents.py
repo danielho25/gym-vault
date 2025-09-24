@@ -7,10 +7,21 @@ import sqlite3
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import numpy as np
+import openai
 from dotenv import load_dotenv
 import datetime
 import re
+import os
+from openai import OpenAI
+from openai import OpenAIError
 
+"""
+v0.0.1:
+- initial chat function using tools and qwen4b model for testing
+
+v0.0.2 09/23/25:
+- reverting to older openai response format so I can use gpt-oss via different machine's lmstudio 
+"""
 
 # Global workout storage
 current_workout_data = None
@@ -21,7 +32,7 @@ def collect_workout_data():
     Collect workout data through simple prompts
     Returns structured workout dictionary
     """
-    print("\n🏋️  Let's log your workout!")
+    print("\nLet's log your workout!")
     print("=" * 40)
 
     # Get basic workout info
@@ -86,18 +97,18 @@ def collect_workout_data():
             else:
                 all_muscle_groups.add("core")  # default if not found
 
-            print(f"✅ Added: {sets} sets x {reps} reps @ {weight}lbs (RPE {rpe})")
+            print(f"Added: {sets} sets x {reps} reps @ {weight}lbs (RPE {rpe})")
             exercise_count += 1
 
         except ValueError:
-            print("❌ Invalid input. Please enter numbers only.")
+            print("Invalid input. Please enter numbers only.")
             continue
         except KeyboardInterrupt:
-            print("\n⏹️  Workout logging cancelled.")
+            print("\nWorkout logging cancelled.")
             return None
 
     if not exercises:
-        print("❌ No exercises logged.")
+        print("No exercises logged.")
         return None
 
     # Build workout dictionary
@@ -111,7 +122,7 @@ def collect_workout_data():
     }
 
     # Display summary
-    print("\n📊 Workout Summary:")
+    print("\nWorkout Summary:")
     print("=" * 40)
     print(f"Duration: {workout_time} minutes")
     print(f"Exercises: {len(exercises)}")
@@ -360,108 +371,227 @@ def recovery(sleep: float, muscle_groups: Optional[List] = None, intensity_level
         "intensity_level": intensity_level
     }
 
-def remove_thinking(text):
-    # Remove everything between <think> and </think> tags
-    cleaned_text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-    return cleaned_text.strip()
 
-# Coach Mike system prompt
-coach_mike = """You are Coach Mike, an experienced personal trainer and fitness coach.
+# open ai old method (not really using tools but openai wont let me connect to a better machine with open gpt)
 
-You have access to these tools:
-- analyze_workout(): Analyzes the user's logged workout data
-- meal_rec(): Provides nutrition recommendations based on their workout
-- recovery(): Gives recovery advice based on sleep and workout intensity
+# load env var to get the connection
+load_dotenv()
 
-The user has already logged their workout data. When they ask questions, use the appropriate tools to give them specific, evidence-based advice.
+coach_mike = """You are Coach Mike, an experienced fitness coach and nutritionist. Your role is to provide clear, safe, and actionable guidance on all aspects of health and fitness, including:
 
-Keep your responses:
-- Encouraging and motivational
-- Specific to their actual workout data
-- Evidence-based and practical
-- 2-3 paragraphs maximum
-- Include specific numbers from the analysis when relevant"""
+- Exercise science (strength training, cardio, flexibility, mobility, sport-specific training)
+- Workout programming (beginner → advanced plans, progression, periodization, body weight vs. weights, home vs. gym)
+- Nutrition (macros, calories, hydration, meal timing, supplements — with evidence-based recommendations)
+- Recovery & injury prevention (stretching, sleep, rest days, active recovery, stress management)
+- Mindset & habit building (motivation, goal setting, accountability, long-term consistency)
 
-chat_buffer = []
-response_buffer = []
+TOOL USAGE INSTRUCTIONS:
+- Always use the analyze tool first when a user describes a workout.
+- Use meal_recommender after analyzing a workout if nutrition questions arise or macros are discussed.
+- Use recovery_planner when discussing rest, sleep, or training frequency.
+- Provide specific, actionable advice based on tool outputs.
 
-def collect_fragment(fragment, round_index=0):
-    """Collect fragments without printing - standalone function"""
-    if hasattr(fragment, 'content'):
-        response_buffer.append(fragment.content)
-    else:
-        response_buffer.append(str(fragment))
+BEHAVIOR & TONE:
+- Be conversational, motivating, and encouraging — like a real coach who adapts to the user’s fitness level and goals.
+- Explain the “why” behind recommendations so the user learns principles, not just quick answers.
+- Stay evidence-based and safe — never recommend extreme or unsafe practices.
+- Tailor advice to the individual (beginner vs. advanced, goals like fat loss, strength, hypertrophy, endurance).
+- Offer flexibility — adapt advice for home workouts, limited equipment, busy schedules, or dietary restrictions.
+- Encourage tracking and measurable progress (logs, goals, reflection).
+- If asked for medical advice beyond general fitness, remind the user to consult a healthcare professional.
 
-def chat_loop():
-    """Main chat loop with Coach Mike"""
+STYLE:
+- Tone: Supportive, knowledgeable, approachable — like a coach who wants the user to succeed.
+- Response length: Maximum 3 natural English paragraphs.
+- Always be encouraging, data-driven, and safety-focused."""
+
+analyze_prompt = """
+Given the analysis data from a workout (intensity, load, density, volume, exercises, and muscle groups), write a short, encouraging summary in plain English.
+
+Guidelines:
+- Start with an overall assessment (Light / Moderate / High / Very High intensity).
+- Mention key stats: total volume, total load, and workout time (if provided).
+- Highlight how many exercises were done and the main muscle groups trained.
+- Be motivating and supportive — like a coach giving quick feedback.
+- Keep it to 3–5 sentences, maximum.
+- Do not output raw numbers in a list — weave them naturally into the summary."""
+
+meal_rec_prompt = """
+Given the meal_rec() data (intensity, macro recommendations, timing advice, and muscle groups trained), write a short, supportive nutrition summary in plain English.
+
+Guidelines:
+- Begin with the overall recommendation (e.g., high intensity = emphasize recovery fueling).
+- Mention protein, carbs, and fat in grams, but weave them naturally into sentences (not a raw list).
+- Include key timing advice (pre/post-workout nutrition and hydration).
+- Tailor the tone to intensity level (light = maintain, moderate = solid recovery, high = prioritize refueling).
+- Be encouraging, practical, and evidence-based.
+- Keep the response 3–5 sentences, maximum.
+- Do not just restate numbers — explain why they matter for recovery and performance."""
+
+recovery_prompt = """
+Given the recovery() data (sleep quality, recovery timeline, hydration, and recommendations), write a short, encouraging recovery summary in plain English.
+
+Guidelines:
+- Start with an assessment of sleep and its impact on recovery. 
+- Mention how long it may take before the trained muscles are fully recovered (in hours or days).
+- Give practical advice: hydration, when to train again, and whether to adjust workout intensity.
+- Tailor the tone to the sleep quality and workout intensity (e.g., supportive if sleep was poor, motivating if sleep was good).
+- Keep the response 3–5 sentences, maximum.
+- Always be positive, actionable, and safety-focused.
+"""
+
+
+def connect_to_gpt(prompt_txt: str, include_context: bool = False):
+    global current_workout_data
+    # model parameters:
+    llm_con = os.getenv("LMS_CONN")
+    default_system_prompt = coach_mike
+
+    client = OpenAI(
+        base_url=llm_con,
+        api_key="a"
+    )
+
+    full_prompt = prompt_txt
+
+    if include_context and current_workout_data:
+        # Add workout context to the prompt
+        workout_analysis = analyze_workout(current_workout_data)
+        context = f"\n\nCurrent workout context: {json.dumps(workout_analysis, indent=2)}"
+        full_prompt = prompt_txt + context
+
+    history = [
+        {"role": "system",
+         "content": coach_mike},
+        {"role": "user",
+         "content":full_prompt}
+    ]
+
+    try:
+        completion = client.chat.completions.create(
+            model="unsloth/gpt-oss-120b",
+            messages=history,
+            max_tokens=1500,
+            frequency_penalty=0.7,
+            reasoning_effort="medium",
+            temperature=1.0,
+        )
+
+        return completion.choices[0].message.content.strip()
+    except openai.APIConnectionError as e:
+        return f"OpenAI Connection error: the server could not be reached: {e}"
+    except openai.APIStatusError as e:
+        return f"OpenAI Rate Limit Error: A 429 status code was received: {e}"
+    except openai.APIError as e:
+        return f"API error: {e}"
+    except Exception as e:
+        return f"Unexpected error: {e}"
+
+
+def process_user_command(user_input: str) -> str:
+    """
+    Process user commands and route to appropriate functions
+
+    Args:
+        user_input: User's input string
+
+    Returns:
+        Response string
+    """
     global current_workout_data
 
-    print("🏋️  Welcome to Coach Mike's Workout Assistant!")
-    print("=" * 50)
+    user_input = user_input.strip().lower()
 
-    # Collect workout data first
-    current_workout_data = collect_workout_data()
+    # Special commands
+    if user_input in ['log workout', 'workout', 'log']:
+        workout_data = collect_workout_data()
+        if workout_data:
+            current_workout_data = workout_data
+            # analysis = analyze_workout(workout_data)
+            return f"Workout logged successfully!"
+        else:
+            return "Workout logging was cancelled or failed."
 
-    if not current_workout_data:
-        print("❌ No workout data collected. Exiting.")
-        return
+    elif user_input in ['analyze', 'analysis']:
+        if current_workout_data:
+            analysis = analyze_workout(current_workout_data)
+            analysis_chat = connect_to_gpt(analyze_prompt, analysis)
+            return analysis_chat
+        else:
+            return "No workout data available. Please log a workout first using 'log workout'."
 
-    print(f"\n✅ Workout logged successfully!")
-    print("💬 Now you can chat with Coach Mike about your training!")
-    print("Ask things like:")
-    print("• 'How was my workout?'")
-    print("• 'What should I eat after this?'")
-    print("• 'How long should I rest before my next workout?'")
-    print("• 'I got 7 hours of sleep, when can I train again?'")
+    elif user_input in ['meal', 'nutrition', 'macros']:
+        if current_workout_data:
+            meal_recs = meal_rec(current_workout_data)
+            meal_rec_chat = connect_to_gpt(meal_rec_prompt, meal_recs)
+            return meal_rec_chat
+        else:
+            return "No workout data available for meal recommendations. Please log a workout first."
 
-    model = lms.llm("qwen/qwen3-4b-thinking-2507:qwen3-4b-thinking-2507-mlx")
-    chat = lms.Chat(coach_mike)
-    tool_list = [analyze_workout, meal_rec, recovery]
+    elif user_input.startswith('recovery'):
+        # Parse sleep hours if provided (e.g., "recovery 7.5")
+        try:
+            parts = user_input.split()
+            sleep_hours = float(parts[1]) if len(parts) > 1 else 7.0
+        except (IndexError, ValueError):
+            sleep_hours = 7.0
 
-    print("\n" + "=" * 50)
+        recovery_plan = recovery(sleep_hours)
+        recovery_resp = connect_to_gpt(recovery_prompt, recovery_plan)
+        return f"Recovery Plan based on {sleep_hours} of sleep: {recovery_resp}"
 
+    elif user_input in ['help', 'commands']:
+        return """Available commands:
+
+• 'log workout' - Start the workout logging process
+• 'analyze' - Show analysis of current workout
+• 'meal' - Get meal recommendations based on workout
+• 'recovery [hours]' - Get recovery plan (optionally specify sleep hours)
+• 'help' - Show this help message
+• 'quit' - Exit the program
+• Any other text will be sent to Coach Mike for fitness advice
+
+Current workout logged: {'Yes' if current_workout_data else 'No'}"""
+
+    elif user_input in ['quit', 'exit', 'q']:
+        return "QUIT"
+
+    else:
+        # Send to LLM with workout context if available
+        include_context = current_workout_data is not None
+        return connect_to_gpt(user_input, include_context=include_context)
+
+def main():
+    """main program chat loop"""
+    print("Welcome! I'm Coach Mike, your personal workout coach!")
+    print("-"*50)
+    print("Type 'help' for available commands or just ask me anything about fitness!")
+    print("Type 'quit' to exit.")
+    print("-" * 50)
+
+    conversation_history = []
     while True:
         try:
-            user_input = input("\nYou: ").strip()
-
-            if user_input.lower() in ['q', 'quit', 'exit', 'done']:
-                print("💪 Great chatting with you! Keep crushing those workouts!")
-                break
-
+            print("You: ")
+            user_input = input().strip()
             if not user_input:
                 continue
 
-            chat.add_user_message(user_input)
-            print("\nCoach Mike: ", end="", flush=True)
+            conversation_history.append(user_input)  # store user messages
+            response = process_user_command(user_input)
 
-            # Clear buffer for new response
-            response_buffer = []
+            if response == "q" or response == "quit":
+                print("thanks for using coach mike!")
+                break
 
-            # Run the model and collect response
-            model.act(
-                chat,
-                tool_list,
-                on_message=chat.append,
-                on_prediction_fragment=collect_fragment,
-            )
-
-            # Filter out thinking tags and print the clean response
-            full_response = ''.join(response_buffer)
-            filtered_response = re.sub(r'<think>.*?</think>', '', full_response, flags=re.DOTALL).strip()
-
-            if filtered_response:
-                print(filtered_response, end="", flush=True)
+            print("Coach Mike: ", response)
+            conversation_history.append(response)
 
         except KeyboardInterrupt:
-            print("\n\n👋 Thanks for the great session!")
+            print(f"keyboard interrupt: thanks for using coach mike!")
             break
         except Exception as e:
-            print(f"\n❌ Error: {e}")
-            print("💭 Try asking a different question about your workout.")
-
-
+            print(f"an error occured: {e}")
 
 if __name__ == "__main__":
-    chat_loop()
-
-
+    main()
